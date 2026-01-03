@@ -29,7 +29,10 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    from cs336_basics.modules import Linear
+    layer = Linear(d_in, d_out, device=in_features.device, dtype=in_features.dtype)
+    layer.load_state_dict({"weight": weights.to(device=in_features.device, dtype=in_features.dtype)})
+    return layer(in_features)
 
 
 def run_embedding(
@@ -51,7 +54,10 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    from cs336_basics.modules import Embedding
+    layer = Embedding(vocab_size, d_model, device=weights.device, dtype=weights.dtype)
+    layer.load_state_dict({"weight": weights.to(device=weights.device, dtype=weights.dtype)})
+    return layer(token_ids)
 
 
 def run_swiglu(
@@ -83,7 +89,16 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    from cs336_basics.modules import SwiGLU
+    swiglu = SwiGLU(d_model=d_model, d_ff=d_ff, device=in_features.device, dtype=w1_weight.dtype)
+    swiglu.load_state_dict(
+        {
+            "w1.weight": w1_weight.to(device=in_features.device, dtype=w1_weight.dtype),
+            "w2.weight": w2_weight.to(device=in_features.device, dtype=w2_weight.dtype),
+            "w3.weight": w3_weight.to(device=in_features.device, dtype=w3_weight.dtype)
+        }
+    )
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -104,7 +119,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    from cs336_basics.modules import scaled_dot_product_attention
+    return scaled_dot_product_attention(query=Q, key=K, value=V, mask=mask)
 
 
 def run_multihead_self_attention(
@@ -138,7 +154,20 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from cs336_basics.modules import CausalMultiHeadSelfAttention
+
+    mha = CausalMultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, device=in_features.device, dtype=q_proj_weight.dtype)
+
+    mha.load_state_dict(
+        {
+            "q_proj.weight": q_proj_weight.to(device=in_features.device, dtype=q_proj_weight.dtype),
+            "k_proj.weight": k_proj_weight.to(device=in_features.device, dtype=k_proj_weight.dtype),
+            "v_proj.weight": v_proj_weight.to(device=in_features.device, dtype=v_proj_weight.dtype),
+            "o_proj.weight": o_proj_weight.to(device=in_features.device, dtype=o_proj_weight.dtype),
+        }
+    )
+
+    return mha(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -178,7 +207,32 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from cs336_basics.modules import CausalMultiHeadSelfAttentionWithRoPE
+
+    if token_positions is None:
+        # Default positions: 0..seq_len-1, broadcast to batch-like dims
+        seq_len = in_features.size(-2)
+        token_positions = torch.arange(seq_len, device=in_features.device, dtype=torch.long)
+        token_positions = token_positions.view(*([1] * (in_features.dim() - 2)), seq_len)
+
+    mha = CausalMultiHeadSelfAttentionWithRoPE(
+        d_model=d_model,
+        num_heads=num_heads,
+        theta=theta,
+        max_seq_len=max_seq_len,
+        device=in_features.device,
+        dtype=q_proj_weight.dtype
+    )
+
+    mha.load_state_dict(
+        {
+            "q_proj.weight": q_proj_weight.to(device=in_features.device, dtype=q_proj_weight.dtype),
+            "k_proj.weight": k_proj_weight.to(device=in_features.device, dtype=k_proj_weight.dtype),
+            "v_proj.weight": v_proj_weight.to(device=in_features.device, dtype=v_proj_weight.dtype),
+            "output_proj.weight": o_proj_weight.to(device=in_features.device, dtype=o_proj_weight.dtype),
+        }
+    )
+    return mha(in_features, token_positions)    
 
 
 def run_rope(
@@ -200,7 +254,9 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    from cs336_basics.modules import RoPE
+    rope = RoPE(theta=theta, d_k=d_k, max_seq_len=max_seq_len, device=in_query_or_key.device)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -273,7 +329,27 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    from cs336_basics.modules import TransformerBlock
+
+    block = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,\
+        theta=theta,
+        device=in_features.device,
+        dtype=in_features.dtype
+    )
+
+    # Move weights to the right device/dtype
+    sd = {k: v.to(device=in_features.device, dtype=in_features.dtype) for k, v in weights.items()}
+    block.load_state_dict(sd)
+
+    # Build token positions: shape (batch, seq_len)
+    batch, seq_len, _ = in_features.shape
+    token_position = torch.arange(seq_len, device=in_features.device, dtype=torch.long).view(1, seq_len).expand(batch, seq_len)
+
+    return block(in_features, token_position)
 
 
 def run_transformer_lm(
@@ -287,7 +363,7 @@ def run_transformer_lm(
     weights: dict[str, Tensor],
     in_indices: Int[Tensor, " batch_size sequence_length"],
 ) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
-    """Given the weights of a Transformer language model and input indices,
+    r"""Given the weights of a Transformer language model and input indices,
     return the output of running a forward pass on the input indices.
 
     This function should use RoPE.
@@ -355,8 +431,25 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from cs336_basics.transformer_lm import TransformerLM
 
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        device=in_indices.device,
+        dtype=torch.float32
+    )
+
+    # Move weights to the correct device/dtype before loading.
+    sd = {k: v.to(device=in_indices.device, dtype=torch.float32) for k, v in weights.items()}
+    model.load_state_dict(sd)
+    
+    return model(in_indices)    
 
 def run_rmsnorm(
     d_model: int,
@@ -378,7 +471,10 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    from cs336_basics.modules import RMSNorm
+    layer = RMSNorm(d_model=d_model, eps=eps, device=in_features.device, dtype=weights.dtype)
+    layer.load_state_dict({"weight": weights.to(device=in_features.device, dtype=weights.dtype)})
+    return layer(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -431,7 +527,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    from cs336_basics.modules import softmax
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(
