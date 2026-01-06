@@ -32,8 +32,8 @@ def get_batch(
     if n < context_length + 1:
         raise ValueError(f"dataset too small: need at least context_length+1 tokens, got n={n}, context_length={context_length}")    
     
-    # Create a CPU tensor view of the dataset
-    x = torch.from_numpy(dataset)
+    # Create a CPU tensor view of the dataset, Cast to a supported dtype for CPU advanced indexing
+    x = torch.from_numpy(dataset).to(torch.long)
 
     # Sample start indices on cpu
     max_start = n - context_length - 1
