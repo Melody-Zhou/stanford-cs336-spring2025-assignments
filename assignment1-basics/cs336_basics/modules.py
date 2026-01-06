@@ -203,6 +203,11 @@ class RoPE(nn.Module):
         x_even = x_fp32[..., ::2]  # (..., seq_len, d_k/2)
         x_odd = x_fp32[..., 1::2]  # (..., seq_len, d_k/2)
 
+        # make cos/sin broadcastable for inputs like (B, H, S, d_k)
+        while cos.dim() < x_even.dim():
+            cos = cos.unsqueeze(cos.dim() - 2)
+            sin = sin.unsqueeze(sin.dim() - 2)        
+
         # Apply 2D rotation for each pair.
         out_even = x_even * cos - x_odd * sin
         out_odd = x_even * sin + x_odd * cos
