@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 import numpy.typing as npt
 
 def get_batch(
@@ -17,8 +18,8 @@ def get_batch(
         device: PyTorch device string, e.g. "cpu", "cuda:0", "mps".
 
     Returns:
-        (inputs, targets): both are torch.LongTensor of shape (batch_size, context_length),
-        placed on the specified device.
+        inputs:  LongTensor of shape (batch_size, context_length)
+        targets: LongTensor of shape (batch_size, context_length)
     """
 
     if dataset.ndim != 1:
@@ -32,21 +33,23 @@ def get_batch(
     if n < context_length + 1:
         raise ValueError(f"dataset too small: need at least context_length+1 tokens, got n={n}, context_length={context_length}")    
     
-    # Create a CPU tensor view of the dataset, Cast to a supported dtype for CPU advanced indexing
-    x = torch.from_numpy(dataset).to(torch.long)
-
     # Sample start indices on cpu
     max_start = n - context_length - 1
-    starts = torch.randint(low=0, high=max_start + 1, size=(batch_size,), device="cpu")
+    starts = np.random.randint(low=0, high=max_start+1, size=(batch_size,), dtype=np.int64)
 
-    # Build positions [batch_size, context_length] via broadcasting
-    offsets = torch.arange(context_length, device="cpu")
-    pos = starts.unsqueeze(1) + offsets.unsqueeze(0)  # (B, S)
+    # Build index matrix of shape (batch_size, context_length + 1)
+    offsets = np.arange(context_length + 1, dtype=np.int64)
+    indices = starts[:, None] + offsets[None, :]
 
-    inputs = x[pos]
-    targets = x[pos + 1]
+    # Gather a small contiguous block from the dataset
+    block = dataset[indices]  # (B, S+1)
 
-    # Ensure dtype is int64 as token IDs, and move to the target device
-    inputs = inputs.to(dtype=torch.long, device=device)
-    targets = targets.to(dtype=torch.long, device=device)
+    # Split into inputs and targets
+    inputs_np = block[:, :-1]
+    targets_np = block[:, 1:]
+
+    # Convert only the small batch to torch tensors and move to target device
+    inputs = torch.from_numpy(inputs_np).to(device=device, dtype=torch.long)
+    targets = torch.from_numpy(targets_np).to(device=device, dtype=torch.long)
+    
     return inputs, targets
