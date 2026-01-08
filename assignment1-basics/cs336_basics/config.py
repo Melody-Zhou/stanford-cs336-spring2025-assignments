@@ -2,16 +2,22 @@ from typing import Optional
 from dataclasses import dataclass, field
 
 @dataclass
+class RunConfig:
+    runs_dir: str = "runs"
+    run_name_prefix: str = "ts_baseline"
+    run_name: Optional[str] = None
+
+@dataclass
 class DataConfig:
     # Memmap token files (1D binary files)
-    train_data_path: str = "data/train.bin"
-    val_data_path: str = "data/val.bin"
+    train_data_path: str = "workspace/tinystories_train.uint16.bin"
+    val_data_path: str = "workspace/tinystories_valid.uint16.bin"
     # Numpy dtype used when creating the token files
     np_dtype: str = "uint16"
 
     context_length: int = 256
 
-    # Device string used by get_batch()
+    # Device string used by get_batch(), cuda:0 or cpu
     device: str = "cuda:0"
 
 @dataclass
@@ -19,12 +25,12 @@ class ModelConfig:
     vocab_size: int = 10_000
     context_length: int = 256
     
-    d_model: int = 256
+    d_model: int = 512
     num_layers: int = 4
-    num_heads: int = 8
+    num_heads: int = 16
 
     # If None, will default to 4 * d_model at model construction time
-    d_ff: Optional[int] = None
+    d_ff: Optional[int] = 1344
 
     rope_theta: float = 10_000.0
     # If None, model will use context_length
@@ -37,11 +43,11 @@ class ModelConfig:
 
 @dataclass
 class OptimizerConfig:
-    lr_max: float = 3e-4
-    lr_min: float = 3e-5
+    lr_max: float = 1e-3
+    lr_min: float = 1e-4
 
-    warmup_iters: int = 200
-    cosine_cycle_iters: int = 10_000
+    warmup_iters: int = 2000
+    cosine_cycle_iters: int = 106_667
     
     beta1: float = 0.9
     beta2: float = 0.999
@@ -52,27 +58,27 @@ class OptimizerConfig:
 
 @dataclass
 class TrainingConfig:
-    max_steps: int = 10_000
-    batch_size: int = 64
+    max_steps: int = 106_667
+    batch_size: int = 12
     
     log_interval: int = 50
-    eval_interval: int = 500
+    eval_interval: int = 2000
     eval_batches: int = 20
 
-    ckpt_interval: int = 1000
-    ckpt_path: str = "checkpoints/ckpt.pt"
+    ckpt_interval: int = 5000
     resume_from: Optional[str] = None
 
-    seed: int = 0
+    seed: int = 42
 
 @dataclass
 class WandbConfig:
-    enable: bool = False
+    enable: bool = True
     project: str = "cs336-a1"
     run_name: str = "train"
 
 @dataclass
 class TrainConfig:
+    run: RunConfig = field(default_factory=RunConfig)
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
