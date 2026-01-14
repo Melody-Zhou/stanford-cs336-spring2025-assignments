@@ -44,6 +44,15 @@ Dependencies are automatically installed based on each assignment's `pyproject.t
 4. Generate samples and evaluate perplexity using the trained Transformer LM.
 5. Train models on OpenWebText and submit your attained perplexities to a leaderboard.
 
+### [Assignment 2: Systems](./assignment2-systems/)
+
+**What you will implement**
+
+1. Benchmarking and profiling harness
+2. Flash Attention 2 Triton kernel
+3. Distributed data parallel training
+4. Optimizer state sharding
+
 ## Reference
 
 - [https://github.com/stanford-cs336/assignment1-basics](https://github.com/stanford-cs336/assignment1-basics/tree/main)
