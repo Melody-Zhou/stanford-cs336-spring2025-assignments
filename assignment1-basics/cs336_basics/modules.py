@@ -2,6 +2,12 @@ import math
 import torch
 from torch import nn
 
+try:
+    import torch.cuda.nvtx as nvtx
+except Exception:
+    nvtx = None
+
+
 class Linear(nn.Module):
     """
     A bias-free Linear layer that matches torch.nn.Linear's interface
@@ -285,7 +291,7 @@ def scaled_dot_product_attention(
 
         # Broadcast mask to logits shape: (..., seq_len, seq_len)
         # True = keep, False = mask out.
-        neg_inf = torch.finfo(torch.float32).min
+        neg_inf = torch.finfo(logits.dtype).min
         logits = torch.where(mask.to(device=logits.device), logits, neg_inf)        
     
     # probs: (..., seq_len, seq_len)
@@ -300,6 +306,69 @@ def scaled_dot_product_attention(
     out = torch.einsum("... s t, ... t d -> ... s d", probs, v)
 
     # Cast back to the original value dtype
+    return out.to(dtype=value.dtype)
+
+class _NvtxRange:
+    def __init__(self, name: str, enabled: bool):
+        self.name = name
+        self.enabled = enabled and (nvtx is not None) and torch.cuda.is_available()
+
+    def __enter__(self):
+        if self.enabled:
+            nvtx.range_push(self.name)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            nvtx.range_pop()
+        return False
+
+
+def annotated_scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    nvtx_enabled: bool = False,
+) -> torch.Tensor:
+    """
+    Annotated version of scaled dot-product attention (for Nsight Systems).
+    It should be numerically identical to scaled_dot_product_attention.
+    """
+    if query.dim() < 2 or key.dim() < 2 or value.dim() < 2:
+        raise ValueError("query/key/value must have shape (..., seq_len, d_*)")
+
+    if query.shape[:-2] != key.shape[:-2] or query.shape[:-2] != value.shape[:-2]:
+        raise ValueError("batch dimensions of query, key, value must match")
+
+    d_k = query.shape[-1]
+    if d_k != key.shape[-1]:
+        raise ValueError("query and key must have the same d_k")
+
+    # Compute attention logits in float32 for stability
+    q = query.to(torch.float32)
+    k = key.to(torch.float32)
+    v = value.to(torch.float32)
+    scale = 1.0 / math.sqrt(d_k)
+
+    with _NvtxRange("attn_qk_matmul", nvtx_enabled):
+        logits = torch.einsum("... s d, ... t d -> ... s t", q, k) * scale
+
+    if mask is not None:
+        if mask.dtype != torch.bool:
+            raise TypeError("mask must be a boolean tensor")
+        neg_inf = torch.finfo(logits.dtype).min
+        logits = torch.where(mask.to(device=logits.device), logits, neg_inf)
+
+    with _NvtxRange("attn_softmax", nvtx_enabled):
+        probs = softmax(logits, dim=-1)
+
+    if mask is not None:
+        probs = probs * mask.to(device=probs.device, dtype=probs.dtype)
+
+    with _NvtxRange("attn_pv_matmul", nvtx_enabled):
+        out = torch.einsum("... s t, ... t d -> ... s d", probs, v)
+
     return out.to(dtype=value.dtype)
 
 class CausalMultiHeadSelfAttention(nn.Module):
