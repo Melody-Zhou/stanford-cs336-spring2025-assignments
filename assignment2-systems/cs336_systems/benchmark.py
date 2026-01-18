@@ -5,6 +5,8 @@ import statistics as stats
 from contextlib import nullcontext
 from cs336_basics.transformer_lm import TransformerLM
 from cs336_systems.utils import BenchmarkReporter, BenchmarkRow
+import torch.cuda.nvtx as nvtx
+from contextlib import contextmanager
 
 
 # Table 1 defaults
@@ -23,6 +25,18 @@ MODEL_SPECS_RTX4060 = {
     "xl":     dict(d_model=768, d_ff=3072, num_layers=12, num_heads=12),  # 768/12=64
     "2.7b":   dict(d_model=768, d_ff=3072, num_layers=16, num_heads=12),  # 768/12=64
 }
+
+
+@contextmanager
+def nvtx_range(name: str, enabled: bool):
+    if enabled and torch.cuda.is_available():
+        nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            nvtx.range_pop()
+    else:
+        yield
 
 
 def torch_dtype_from_string(s: str) -> torch.dtype:
@@ -79,7 +93,7 @@ def step_backward(model, logits):
     loss.backward()
 
 
-def measure_forward_backward_ms(model, x, device, autocast_ctx):
+def measure_forward_backward_ms(model, x, device, autocast_ctx, nvtx_enabled: bool = False):
     """
     Return (forward_ms, backward_ms) for one step.
     Uses CUDA events when on GPU, otherwise falls back to timeit.
@@ -92,11 +106,13 @@ def measure_forward_backward_ms(model, x, device, autocast_ctx):
         end_b = torch.cuda.Event(enable_timing=True)
 
         start_f.record()
-        logits = step_forward(model, x, autocast_ctx)
+        with nvtx_range("forward", nvtx_enabled):
+            logits = step_forward(model, x, autocast_ctx)
         end_f.record()
 
         start_b.record()
-        step_backward(model, logits)
+        with nvtx_range("backward", nvtx_enabled):
+            step_backward(model, logits)
         end_b.record()
 
         torch.cuda.synchronize()
@@ -122,20 +138,28 @@ def run_benchmark_split(args, device, autocast_ctx):
     model = make_model(args, device)
     x = make_batch(args, device)
 
-    # Warmup
-    for _ in range(args.warmup_steps):
-        f_ms, b_ms = measure_forward_backward_ms(model, x, device, autocast_ctx)
-        # Already synchronized in CUDA path; keep this for safety/CPU
-        sync_if_cuda(device)
+    with nvtx_range("benchmark", args.nvtx):
+        # Warmup
+        with nvtx_range("warmup", args.nvtx):
+            for _ in range(args.warmup_steps):
+                with nvtx_range("step", args.nvtx):
+                    with nvtx_range("forward_backward_time", args.nvtx):
+                        f_ms, b_ms = measure_forward_backward_ms(model, x, device, autocast_ctx, nvtx_enabled=args.nvtx)
+                # Already synchronized in CUDA path; keep this for safety/CPU
+                sync_if_cuda(device)
 
-    f_times = []
-    b_times = []
-    for _ in range(args.measure_steps):
-        f_ms, b_ms = measure_forward_backward_ms(model, x, device, autocast_ctx)
-        f_times.append(f_ms)
-        b_times.append(b_ms)
+        # Measure
+        with nvtx_range("measure", args.nvtx):
+            f_times = []
+            b_times = []
+            for _ in range(args.measure_steps):
+                with nvtx_range("step", args.nvtx):
+                    with nvtx_range("forward_backward_timed", args.nvtx):
+                        f_ms, b_ms = measure_forward_backward_ms(model, x, device, autocast_ctx, nvtx_enabled=args.nvtx)
+                f_times.append(f_ms)
+                b_times.append(b_ms)
 
-    return f_times, b_times
+            return f_times, b_times
 
 
 def stats_ms(times_ms):
@@ -236,7 +260,18 @@ def main():
     p.add_argument("--sweep", action="store_true",
                    help="Run sweep over model sizes and context lengths.")
     p.add_argument("--sweep-models", type=str, default="small,medium,large,xl,2.7b")
-    p.add_argument("--sweep-contexts", type=str, default="128,256,512,1024")    
+    p.add_argument("--sweep-contexts", type=str, default="128,256,512,1024")
+    
+    # NVTX
+    p.add_argument("--nvtx", action="store_true", help="Emit NVTX ranges for Nsight Systems profiling.")
+
+    # Profiling (nsys) mode
+    p.add_argument("--profile", action="store_true",
+                help="Run a short workload for Nsight Systems profiling (does not affect normal benchmarking).")
+    p.add_argument("--profile-mode", choices=["inference", "train_step"], default="inference",
+                help="Profiling workload: inference (forward only) or train_step (forward+loss+backward+adamw).")
+    p.add_argument("--profile-steps", type=int, default=1,
+                help="How many measured steps to run in profiling mode.")
 
     args = p.parse_args()
 
@@ -281,4 +316,9 @@ if __name__ == "__main__":
     #     --write-md \
     #     --sweep \
     #     --sweep-contexts 128
+    # 
+    # 
+    # (a) Nsys profile 
+    # 
+    # bash scripts/profile_nsys_models.sh
     # ---------------------------------------------------------------------
