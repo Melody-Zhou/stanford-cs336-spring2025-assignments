@@ -7,7 +7,8 @@ from cs336_basics.transformer_lm import TransformerLM
 from cs336_systems.utils import BenchmarkReporter, BenchmarkRow
 import torch.cuda.nvtx as nvtx
 from contextlib import contextmanager
-
+from cs336_basics.nn_utils import cross_entropy_from_logits
+from cs336_basics.optimizer import AdamW
 
 # Table 1 defaults
 MODEL_SPECS = {
@@ -78,6 +79,23 @@ def make_batch(args, device: torch.device) -> torch.Tensor:
     # Random token IDs (batch, seq)
     x = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=device, dtype=torch.long)
     return x
+
+
+def make_batch_xy(args, device: torch.device) -> torch.Tensor:
+    # Random token IDs (batch, seq)
+    x = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=device, dtype=torch.long)
+    y = torch.randint(0, args.vocab_size, (args.batch_size, args.context_length), device=device, dtype=torch.long)
+    return x, y
+
+
+def make_optimizer_from_args(model: torch.nn.Module):
+    return AdamW(
+        model.parameters(),
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-1
+    )
 
 
 def step_forward(model, x, autocast_ctx):
@@ -230,6 +248,80 @@ def run_sweep(args, reporter, device: torch.device, autocast_ctx):
                     torch.cuda.empty_cache()
 
 
+def run_profile_workload(args, device: torch.device, autocast_ctx):
+    model = make_model(args, device)
+    optimizer = make_optimizer_from_args(model) if args.profile_mode == "train_step" else None
+
+    # Warmup
+    for _ in range(args.warmup_steps):
+        if args.profile_mode == "inference":
+            x = make_batch(args, device)
+            with nvtx_range("forward", args.nvtx):
+                _ = step_forward(model, x, autocast_ctx)
+        else:
+            x, y = make_batch_xy(args, device)
+            with nvtx_range("forward", args.nvtx):
+                logits = step_forward(model, x, autocast_ctx)
+
+            with nvtx_range("loss", args.nvtx):
+                B, S, V = logits.shape
+                loss = cross_entropy_from_logits(logits.reshape(B * S, V), y.reshape(B * S))
+
+            with nvtx_range("backward", args.nvtx):
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+
+            with nvtx_range("adamw_step", args.nvtx):
+                optimizer.step()
+
+        sync_if_cuda(device)
+
+    # ---------------------------
+    # Memory profiling: start recording AFTER warmup (so warmup noise is excluded)
+    # ---------------------------
+    mem_enabled = bool(getattr(args, "mem_profile", False)) and (device.type == "cuda")
+    if mem_enabled:
+        torch.cuda.synchronize()
+        torch.cuda.memory._record_memory_history(max_entries=getattr(args, "mem_max_entries", 1_000_000))
+
+    # Measured (for nsys)
+    for _ in range(args.profile_steps):
+        with nvtx_range("profile_step", args.nvtx):
+            if args.profile_mode == "inference":
+                x = make_batch(args, device)
+                with nvtx_range("forward", args.nvtx):
+                    _ = step_forward(model, x, autocast_ctx)
+            else:
+                x, y = make_batch_xy(args, device)
+
+                with nvtx_range("forward", args.nvtx):
+                    logits = step_forward(model, x, autocast_ctx)
+
+                with nvtx_range("loss", args.nvtx):
+                    B, S, V = logits.shape
+                    loss = cross_entropy_from_logits(logits.reshape(B * S, V), y.reshape(B * S))
+
+                with nvtx_range("backward", args.nvtx):
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+
+                with nvtx_range("adamw_step", args.nvtx):
+                    optimizer.step()
+
+        sync_if_cuda(device)
+
+    # ---------------------------
+    # Memory profiling: dump snapshot and stop recording
+    # ---------------------------
+    if mem_enabled:
+        torch.cuda.synchronize()
+        out_prefix = getattr(args, "mem_out", "runs/memory_snapshot")
+        out_path = f"{out_prefix}_{args.profile_mode}_s{args.context_length}.pickle"
+        torch.cuda.memory._dump_snapshot(out_path)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"[mem-profile] dumped snapshot: {out_path}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model-size", choices=list(MODEL_SPECS_RTX4060.keys()), default="small")
@@ -273,6 +365,18 @@ def main():
     p.add_argument("--profile-steps", type=int, default=1,
                 help="How many measured steps to run in profiling mode.")
 
+    # Profiling self-attention NVTX
+    p.add_argument("--nvtx-attn", action="store_true", help="Use annotated attention (NVTX ranges inside attention).")
+
+    # Memory profiling (PyTorch memory snapshot)
+    p.add_argument("--mem-profile", action="store_true",
+                   help="Enable PyTorch CUDA memory history recording and dump a snapshot pickle.")
+    p.add_argument("--mem-out", type=str, default="runs/memory_snapshot",
+                   help="Output prefix for memory snapshot pickle.")
+    p.add_argument("--mem-max-entries", type=int, default=1_000_000,
+                   help="Max entries for torch.cuda.memory._record_memory_history.")
+
+
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -297,10 +401,21 @@ def main():
             title="#### Forward / Backward timing"
         )
 
+    if args.nvtx_attn:
+        import cs336_basics.modules as m
+
+        def _patched_sdp_attn(q, k, v, mask=None):
+            return m.annotated_scaled_dot_product_attention(q, k, v, mask=mask, nvtx_enabled=True)
+
+        m.scaled_dot_product_attention = _patched_sdp_attn
+
     if args.sweep:
         run_sweep(args, reporter, device, autocast_ctx)
     else:
         run_one_setting(args, reporter, device, autocast_ctx)
+
+    if args.profile:
+        run_profile_workload(args, device, autocast_ctx)
 
 
 if __name__ == "__main__":
@@ -321,4 +436,60 @@ if __name__ == "__main__":
     # (a) Nsys profile 
     # 
     # bash scripts/profile_nsys_models.sh
+    # 
+    # 
+    # (d) Train step
+    # 
+    # Foward-only
+    #   uv run nsys profile \
+    #     -o runs/nsys_d_infer_2.7b_s128 \
+    #     --force-overwrite=true \
+    #     --trace=cuda,nvtx \
+    #     --sample=none \
+    #     --cpuctxsw=none \
+    #     python cs336_systems/benchmark.py \
+    #     --model-size 2.7b --context-length 128 \
+    #     --nvtx --profile --profile-mode inference --profile-steps 1
+    # 
+    # Forward + CE + Backward + AdamW
+    #   uv run nsys profile \
+    #     -o runs/nsys_d_train_2.7b_s128 \
+    #     --force-overwrite=true \
+    #     --trace=cuda,nvtx \
+    #     --sample=none \
+    #     --cpuctxsw=none \
+    #     python cs336_systems/benchmark.py \
+    #     --model-size 2.7b --context-length 128 \
+    #     --nvtx --profile --profile-mode train_step --profile-steps 1
+    #
+    # 
+    # (e) NVTX-annotated attention
+    # 
+    # Foward-only with attention NVTX
+    #   uv run nsys profile -o runs/nsys_e_attn_2p7b_s128 \
+    #     --force-overwrite=true --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+    #     python cs336_systems/benchmark.py \
+    #     --model-size 2.7b --context-length 128 \
+    #     --nvtx --nvtx-attn
+    #     --profile --profile-mode inference --profile-steps 1 --warmup-steps 1
+    # 
+    # 
+    # (c) Mix precision
+    # 
+    # Mix precision benchmarking
+    #   uv run python cs336_systems/benchmark.py \
+    #     --out-jsonl runs/bench.jsonl \
+    #     --out-md runs/bench.md \
+    #     --write-md \
+    #     --sweep \
+    #     --sweep-contexts 128
+    #     --amp bf16
+    # 
+    # (a) Memory profiling
+    # 
+    # Memory profiling with PyTorch memory snapshot
+    #   uv run python cs336_systems/benchmark.py \
+    #     --model-size 2.7b --context-length 128 \
+    #     --profile --profile-mode inference --profile-steps 1 --warmup-steps 5 \
+    #     --mem-profile --mem-out runs/mem_2p7b
     # ---------------------------------------------------------------------
