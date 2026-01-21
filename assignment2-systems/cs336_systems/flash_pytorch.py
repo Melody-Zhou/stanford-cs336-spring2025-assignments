@@ -22,8 +22,15 @@ def flash_bwd_recompute_impl(
     K = k.shape[1]
     scale = 1.0 / math.sqrt(D)
 
+    qf = q.float()
+    kf = k.float()
+    vf = v.float()
+    of = o.float()
+    dof = do.float()
+    Lf = L.float()
+
     # S = QK^T * scale : (B, Q, K)
-    S = torch.matmul(q, k.transpose(-1, -2)) * scale
+    S = torch.matmul(qf, kf.transpose(-1, -2)) * scale
 
     if is_causal:
         q_idx = torch.arange(Q, device=S.device)[:, None]
@@ -32,25 +39,25 @@ def flash_bwd_recompute_impl(
         S = torch.where(casual[None, :, :], S, torch.full_like(S, -1.0e6))
     
     # P = exp(S - L) : (B, Q, K)
-    P = torch.exp(S - L.unsqueeze(-1))
+    P = torch.exp(S - Lf.unsqueeze(-1))
 
     # dV = P^T @ dO : (B, K, D)
-    dv = torch.matmul(P.transpose(-1, -2), do)
+    dv = torch.matmul(P.transpose(-1, -2), dof)
 
     # dP = dO @ V^T : (B, Q, K)
-    dP = torch.matmul(do, v.transpose(-1, -2))
+    dP = torch.matmul(dof, vf.transpose(-1, -2))
 
     # Dvec = sum(dO * O, dim=-1) : (B, Q)
-    Dvec = (do * o).sum(dim=-1)
+    Dvec = (dof * of).sum(dim=-1)
 
     # dS = P * (dP - Dvec) * scale : (B, Q, K)
     dS = P * (dP - Dvec.unsqueeze(-1)) * scale
 
     # dQ = dS @ K : (B, Q, D)
-    dq = torch.matmul(dS, k)
+    dq = torch.matmul(dS, kf)
 
     # dK = dS^T @ Q : (B, K, D)
-    dk = torch.matmul(dS.transpose(-1, -2), q)
+    dk = torch.matmul(dS.transpose(-1, -2), qf)
 
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)  
 
