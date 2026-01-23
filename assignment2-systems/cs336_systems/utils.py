@@ -100,7 +100,7 @@ class BenchmarkReporter:
         df = df.copy()
 
         MODEL_SIZE_ORDER = ["small", "medium", "large", "xl", "2.7b"]
-        MODE_ORDER = ["forward", "backward"]   # 你想要的顺序
+        MODE_ORDER = ["forward", "backward"]
 
         if "model_size" in df.columns:
             df["model_size"] = pd.Categorical(df["model_size"], categories=MODEL_SIZE_ORDER, ordered=True)
@@ -371,7 +371,6 @@ class LeaderboardBenchmarkReporter:
         if df.empty:
             return f"{self.title}\n\n(no rows)\n"
 
-        # 排序：先 variant，再 dtype，再 seq，再 head/dh
         sort_cols = ["variant", "dtype", "seq_len", "n_heads", "d_head"]
         df = df.sort_values(sort_cols, ascending=True)
 
