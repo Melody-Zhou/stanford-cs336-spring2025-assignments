@@ -94,38 +94,88 @@ def flash_fwd_kernel(
     # absolute query indices used only for causal masking
     q_abs = pid_q * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
 
-    for kb in range(0, N_KEYS, K_TILE_SIZE):
-        # load one (K_TILE_SIZE, D) tile of K and V
-        k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bk, D]
-        v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero")                 # [Bk, D]
+    if IS_CAUSAL:
+        # Phase 1: Non-diagonal tiles (fully inside the causal mask)
+        # Iterate over K tiles [0, pid_q * Q_TILE_SIZE]
+        # These tiles are completely visible to the current Q tile, so no mask is needed.
+        limit_nonding = min(N_KEYS, pid_q * Q_TILE_SIZE)
+        for _ in range(0, limit_nonding, K_TILE_SIZE):
+            k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero")
 
-        # S = q @ k^T * scale -> [Bq, Bk]
-        S = tl.dot(q, tl.trans(k)) * scale  # float32
+            # S = q @ k^T * scale -> [Bq, Bk]
+            S = tl.dot(q, tl.trans(k)) * scale  # float32
 
-        # causal mask: keep if q_idx >= k_idx else -1e-6
-        if IS_CAUSAL:
-            k_abs = kb + tl.arange(0, K_TILE_SIZE)
+            # online softmax update (no causal mask check here)
+            m_new = tl.maximum(m, tl.max(S, axis=1))  # [Bq]
+            p = tl.exp(S - m_new[:, None])            # [Bq, Bk]
+            alpha = tl.exp(m - m_new)                 # [Bq]
+            l_new = alpha * l + tl.sum(p, axis=1)     # [Bq]
+
+            # acc = alpha * acc + p @ v
+            p = p.to(v.dtype)
+            acc = alpha[:, None] * acc
+            acc = tl.dot(p, v, acc=acc)
+            m = m_new
+            l = l_new            
+
+            # advance K/V block pointers
+            K_it = K_it.advance((K_TILE_SIZE, 0))
+            V_it = V_it.advance((K_TILE_SIZE, 0))
+
+        # Phase 2: Diagonal tile (partial causal mask)
+        # Only process if the diagonal tile exists (i.e., within N_KEYS)
+        if pid_q * Q_TILE_SIZE < N_KEYS:
+            k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero")
+            S = tl.dot(q, tl.trans(k)) * scale
+
+            # causal mask: keep if q_idx >= k_idx else -1e-6
+            k_abs = pid_q * Q_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
             S = tl.where(q_abs[:, None] >= k_abs[None, :], S, -1.0e6)
 
-        # online softmax update
-        m_new = tl.maximum(m, tl.max(S, axis=1))  # [Bq]
-        p = tl.exp(S - m_new[:, None])            # [Bq, Bk]
+            # online softmax update
+            m_new = tl.maximum(m, tl.max(S, axis=1))
+            p = tl.exp(S - m_new[:, None])
+            alpha = tl.exp(m - m_new)
+            l_new = alpha * l + tl.sum(p, axis=1)
 
-        alpha = tl.exp(m - m_new)                 # [Bq]
-        l_new = alpha * l + tl.sum(p, axis=1)     # [Bq]
+            # acc = alpha * acc + p @ v
+            p = p.to(v.dtype)
+            acc = alpha[:, None] * acc
+            acc = tl.dot(p, v, acc=acc)
+            m = m_new
+            l = l_new
+            # No need to advace further, as tiles > pid_q are fully masked out
+    else:
+        # Non-causal path: process all tiles
+        for _ in range(0, N_KEYS, K_TILE_SIZE):
+            # load one (K_TILE_SIZE, D) tile of K and V
+            k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bk, D]
+            v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero")                 # [Bk, D]
 
-        # acc = alpha * acc + p @ v
-        # p needs to match v dtype before dot
-        p = p.to(v.dtype)
-        acc = alpha[:, None] * acc
-        acc = tl.dot(p, v, acc=acc)
+            # S = q @ k^T * scale -> [Bq, Bk]
+            S = tl.dot(q, tl.trans(k)) * scale  # float32
 
-        m = m_new
-        l = l_new
+            # online softmax update
+            m_new = tl.maximum(m, tl.max(S, axis=1))  # [Bq]
+            p = tl.exp(S - m_new[:, None])            # [Bq, Bk]
 
-        # advance K/V block pointers to the next tile along the sequence dimension
-        K_it = K_it.advance((K_TILE_SIZE, 0))
-        V_it = V_it.advance((K_TILE_SIZE, 0))
+            alpha = tl.exp(m - m_new)                 # [Bq]
+            l_new = alpha * l + tl.sum(p, axis=1)     # [Bq]
+
+            # acc = alpha * acc + p @ v
+            # p needs to match v dtype before dot
+            p = p.to(v.dtype)
+            acc = alpha[:, None] * acc
+            acc = tl.dot(p, v, acc=acc)
+
+            m = m_new
+            l = l_new
+
+            # advance K/V block pointers to the next tile along the sequence dimension
+            K_it = K_it.advance((K_TILE_SIZE, 0))
+            V_it = V_it.advance((K_TILE_SIZE, 0))
 
     # write O and L
     # store output in the original input dtype
@@ -246,33 +296,76 @@ def flash_bwd_dq_kernel(
     K_it = K_bp
     V_it = V_bp
 
-    # sweep K/V tiles
-    for kb in range(0, N_KEYS, K_TILE_SIZE):
-        k_idx = kb + tl.arange(0, K_TILE_SIZE)  # [Bk]
+    if IS_CAUSAL:
+        # Phase 1: Non-diagonal K tiles [0, pid_q * K_TILE_SIZE)
+        limit_nondiag = min(N_KEYS, pid_q * Q_TILE_SIZE)
+        for _ in range(0, limit_nondiag, K_TILE_SIZE):
+            k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
 
-        k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bk, D]
-        v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bk, D]
+            # S: [Bq, Bk]
+            S = tl.dot(q, tl.trans(k)) * scale
+            
+            # No mask needed for k < q
+            # P = exp(S - L)
+            P = tl.exp(S - L[:, None])  # [Bq, Bk]
+            
+            # dP = dO @ V^T
+            dP = tl.dot(do, tl.trans(v))  # [Bq, Bk]
+            
+            # dS = P * (dP - D_row)
+            dS = P * (dP - D_row[:, None])  # [Bq, Bk]
+            
+            # dQ += dS @ K * scale
+            dq_acc += tl.dot(dS, k) * scale
+            K_it = K_it.advance((K_TILE_SIZE, 0))
+            V_it = V_it.advance((K_TILE_SIZE, 0))
 
-        # S: [Bq, Bk]
-        S = tl.dot(q, tl.trans(k)) * scale
-        if IS_CAUSAL:
+        # Phase 2: Diagonal K tile (kb = pid_q * K_TILE_SIZE)
+        if pid_q * Q_TILE_SIZE < N_KEYS:
+            k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            S = tl.dot(q, tl.trans(k)) * scale
+
+            # Apply mask for the diagonal
+            k_idx = pid_q * Q_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
             S = tl.where(q_idx[:, None] >= k_idx[None, :], S, -1.0e6)
+            
+            # P = exp(S - L)
+            P = tl.exp(S - L[:, None])
 
-        # P = exp(S - L)
-        P = tl.exp(S - L[:, None])  # [Bq, Bk]
+            # dP = dO @ V^T
+            dP = tl.dot(do, tl.trans(v))
 
-        # dP = dO @ V^T
-        dP = tl.dot(do, tl.trans(v))  # [Bq, Bk]
+            # dS = P * (dP - D_row)
+            dS = P * (dP - D_row[:, None])
 
-        # dS = P * (dP - D_row)
-        dS = P * (dP - D_row[:, None])  # [Bq, Bk]
+            # dQ += dS @ K * scale
+            dq_acc += tl.dot(dS, k) * scale
+    else:
+        # Non-causal path
+        for _ in range(0, N_KEYS, K_TILE_SIZE):
+            k = tl.load(K_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bk, D]
+            v = tl.load(V_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bk, D]
 
-        # dQ += dS @ K * scale
-        dq_acc += tl.dot(dS, k) * scale
+            # S: [Bq, Bk]
+            S = tl.dot(q, tl.trans(k)) * scale
 
-        # advance K/V block pointers to the next tile along the sequence dimension
-        K_it = K_it.advance((K_TILE_SIZE, 0))
-        V_it = V_it.advance((K_TILE_SIZE, 0))
+            # P = exp(S - L)
+            P = tl.exp(S - L[:, None])  # [Bq, Bk]
+
+            # dP = dO @ V^T
+            dP = tl.dot(do, tl.trans(v))  # [Bq, Bk]
+
+            # dS = P * (dP - D_row)
+            dS = P * (dP - D_row[:, None])  # [Bq, Bk]
+
+            # dQ += dS @ K * scale
+            dq_acc += tl.dot(dS, k) * scale
+
+            # advance K/V block pointers to the next tile along the sequence dimension
+            K_it = K_it.advance((K_TILE_SIZE, 0))
+            V_it = V_it.advance((K_TILE_SIZE, 0))
 
     tl.store(DQ_bp, dq_acc.to(q_raw.dtype), boundary_check=(0, 1))
 
@@ -396,41 +489,117 @@ def flash_bwd_dkdv_kernel(
     DO_it = DO_bp
     L_it  = L_bp
 
-    # sweep Q tiles
-    for qb in range(0, N_QUERIES, Q_TILE_SIZE):
-        q_idx = qb + tl.arange(0, Q_TILE_SIZE)  # [Bq]
+    if IS_CAUSAL:
+        # Optimization: Start from the diagonal Q tile (pid_k * Q_TILE_SIZE)
+        # Previous Q tiles (i < k) are masked out and contribute 0 gradient to K[k], V[k]
+        start_q_offset = pid_k * Q_TILE_SIZE
 
-        q  = tl.load(Q_it,  boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bq, D]
-        o  = tl.load(O_it,  boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bq, D]
-        do = tl.load(DO_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bq, D]
-        L  = tl.load(L_it,  boundary_check=(0,),   padding_option="zero").to(tl.float32)  # [Bq]
+        # Advance pointers to the start Q tile
+        Q_it  = Q_it.advance((start_q_offset, 0))
+        O_it  = O_it.advance((start_q_offset, 0))
+        DO_it = DO_it.advance((start_q_offset, 0))
+        L_it  = L_it.advance((start_q_offset,))
+        
+        # Phase 1: Diagonal Q tile (needs mask)
+        if start_q_offset < N_QUERIES:
+            q  = tl.load(Q_it,  boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            o  = tl.load(O_it,  boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            do = tl.load(DO_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            L  = tl.load(L_it,  boundary_check=(0,),   padding_option="zero").to(tl.float32)
+            D_row = tl.sum(do * o, axis=1)   # [Bq]
 
-        D_row = tl.sum(do * o, axis=1)   # [Bq]
-
-        # S: [Bq, Bk]
-        S = tl.dot(q, tl.trans(k)) * scale
-        if IS_CAUSAL:
+            # S: [Bq, Bk]
+            S = tl.dot(q, tl.trans(k)) * scale
+            
+            # Mask: q_idx >= k_idx
+            q_idx = start_q_offset + tl.arange(0, Q_TILE_SIZE)
             S = tl.where(q_idx[:, None] >= k_idx[None, :], S, -1.0e6)
+            
+            # P = exp(S - L)
+            P = tl.exp(S - L[:, None])  # [Bq, Bk]
+            
+            # dP = dO @ V^T
+            dP = tl.dot(do, tl.trans(v))  # [Bq, Bk]
+            
+            # dS = P * (dP - D_row)
+            dS = P * (dP - D_row[:, None])  # [Bq, Bk]
+            
+            # dV += P^T @ dO
+            dv_acc += tl.dot(tl.trans(P), do)
+            
+            # dK += dS^T @ Q * scale
+            dk_acc += tl.dot(tl.trans(dS), q) * scale
+            
+            # Advance to next tile
+            Q_it  = Q_it.advance((Q_TILE_SIZE, 0))
+            O_it  = O_it.advance((Q_TILE_SIZE, 0))
+            DO_it = DO_it.advance((Q_TILE_SIZE, 0))
+            L_it  = L_it.advance((Q_TILE_SIZE,))
 
-        # P = exp(S - L)
-        P = tl.exp(S - L[:, None])  # [Bq, Bk]
+        # Phase 2: Non-diagonal Q tiles (qb > start_q_offset, no mask)
+        for _ in range(start_q_offset + Q_TILE_SIZE, N_QUERIES, Q_TILE_SIZE):
+            q  = tl.load(Q_it,  boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            o  = tl.load(O_it,  boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            do = tl.load(DO_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+            L  = tl.load(L_it,  boundary_check=(0,),   padding_option="zero").to(tl.float32)
+            D_row = tl.sum(do * o, axis=1)
 
-        # dP = dO @ V^T
-        dP = tl.dot(do, tl.trans(v))  # [Bq, Bk]
+            # S: [Bq, Bk]
+            S = tl.dot(q, tl.trans(k)) * scale
+            
+            # No mask needed for q > k
+            # P = exp(S - L)
+            P = tl.exp(S - L[:, None])
 
-        # dS = P * (dP - D_row)
-        dS = P * (dP - D_row[:, None])  # [Bq, Bk]
+            # dP = dO @ V^T
+            dP = tl.dot(do, tl.trans(v))
 
-        # dV += P^T @ dO
-        dv_acc += tl.dot(tl.trans(P), do)
+            # dS = P * (dP - D_row)
+            dS = P * (dP - D_row[:, None])
 
-        # dK += dS^T @ Q * scale
-        dk_acc += tl.dot(tl.trans(dS), q) * scale
+            # dV += P^T @ dO
+            dv_acc += tl.dot(tl.trans(P), do)
 
-        Q_it  = Q_it.advance((Q_TILE_SIZE, 0))
-        O_it  = O_it.advance((Q_TILE_SIZE, 0))
-        DO_it = DO_it.advance((Q_TILE_SIZE, 0))
-        L_it  = L_it.advance((Q_TILE_SIZE,))
+            # dK += dS^T @ Q * scale
+            dk_acc += tl.dot(tl.trans(dS), q) * scale
+
+            # Advance to next tile
+            Q_it  = Q_it.advance((Q_TILE_SIZE, 0))
+            O_it  = O_it.advance((Q_TILE_SIZE, 0))
+            DO_it = DO_it.advance((Q_TILE_SIZE, 0))
+            L_it  = L_it.advance((Q_TILE_SIZE,))
+    else:
+        # Non-causal path: standard sweep
+        for _ in range(0, N_QUERIES, Q_TILE_SIZE):
+            q  = tl.load(Q_it,  boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bq, D]
+            o  = tl.load(O_it,  boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bq, D]
+            do = tl.load(DO_it, boundary_check=(0, 1), padding_option="zero").to(tl.float32)  # [Bq, D]
+            L  = tl.load(L_it,  boundary_check=(0,),   padding_option="zero").to(tl.float32)  # [Bq]
+
+            D_row = tl.sum(do * o, axis=1)   # [Bq]
+
+            # S: [Bq, Bk]
+            S = tl.dot(q, tl.trans(k)) * scale
+
+            # P = exp(S - L)
+            P = tl.exp(S - L[:, None])  # [Bq, Bk]
+
+            # dP = dO @ V^T
+            dP = tl.dot(do, tl.trans(v))  # [Bq, Bk]
+
+            # dS = P * (dP - D_row)
+            dS = P * (dP - D_row[:, None])  # [Bq, Bk]
+
+            # dV += P^T @ dO
+            dv_acc += tl.dot(tl.trans(P), do)
+
+            # dK += dS^T @ Q * scale
+            dk_acc += tl.dot(tl.trans(dS), q) * scale
+
+            Q_it  = Q_it.advance((Q_TILE_SIZE, 0))
+            O_it  = O_it.advance((Q_TILE_SIZE, 0))
+            DO_it = DO_it.advance((Q_TILE_SIZE, 0))
+            L_it  = L_it.advance((Q_TILE_SIZE,))
 
     tl.store(DK_bp, dk_acc.to(k_raw.dtype), boundary_check=(0, 1))
     tl.store(DV_bp, dv_acc.to(v_raw.dtype), boundary_check=(0, 1))
