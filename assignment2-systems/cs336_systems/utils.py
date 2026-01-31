@@ -384,3 +384,400 @@ class LeaderboardBenchmarkReporter:
 
     def write_markdown(self) -> None:
         self.md_path.write_text(self.render_markdown(), encoding="utf-8")
+
+
+@dataclass
+class DDPCommRow:
+    backend: str               # "gloo" / "nccl"
+    device: str                # "cpu" / "cuda"
+    world_size: int
+    op: str                    # e.g. "all_reduce"
+    size_bytes: int
+    dtype: str                 # "float32"
+    warmup_steps: int
+    measure_steps: int
+    mean_ms: float
+    std_ms: float
+    max_ms: float
+
+
+class DDPCommBenchmarkReporter:
+    """
+    DDP communication benchmark reporter:
+      - append rows to JSONL
+      - render markdown table
+      - write markdown to file
+    """
+
+    def __init__(
+        self,
+        jsonl_path: str | Path,
+        md_path: str | Path,
+        *,
+        title: str = "#### DDP communication benchmark (single node)",
+        float_fmt: str = ".3f",
+        sort_cols: Optional[List[str]] = None,
+        cols: Optional[List[str]] = None,
+    ) -> None:
+        self.jsonl_path = Path(jsonl_path)
+        self.md_path = Path(md_path)
+        self.title = title
+        self.float_fmt = float_fmt
+
+        self.sort_cols = sort_cols or ["backend", "device", "world_size", "op", "size_bytes", "dtype"]
+        self.cols = cols or [
+            "backend",
+            "device",
+            "world_size",
+            "op",
+            "size_bytes",
+            "dtype",
+            "warmup_steps",
+            "measure_steps",
+            "mean_ms",
+            "std_ms",
+            "max_ms",
+        ]
+
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row: DDPCommRow) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+
+    def read_df(self) -> pd.DataFrame:
+        if not self.jsonl_path.exists():
+            return pd.DataFrame()
+        records: List[Dict[str, Any]] = []
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return pd.DataFrame.from_records(records)
+
+    @staticmethod
+    def _center_align_markdown(md: str) -> str:
+        lines = md.splitlines()
+        if len(lines) < 2:
+            return md
+        header = lines[0]
+        cols = header.count("|") - 1
+        centered = "| " + " | ".join([":---:" for _ in range(cols)]) + " |"
+        return "\n".join([lines[0], centered] + lines[2:])
+
+    def render_markdown(self) -> str:
+        df = self.read_df()
+        if df.empty:
+            return f"{self.title}\n\n(no rows)\n"
+
+        df = df.copy()
+
+        # sort + select columns
+        df = df.sort_values(self.sort_cols)
+        df = df[self.cols]
+
+        # float formatting
+        for c in ["mean_ms", "std_ms", "max_ms"]:
+            if c in df.columns:
+                df[c] = df[c].map(lambda x: "" if pd.isna(x) else f"{float(x):{self.float_fmt}}")
+
+        md = [self.title, "", self._center_align_markdown(df.to_markdown(index=False)), ""]
+        return "\n".join(md)
+
+    def write_markdown(self) -> None:
+        self.md_path.write_text(self.render_markdown(), encoding="utf-8")
+
+
+@dataclass
+class NaiveDDPBenchRow:
+    model_size: str            # "xl"
+    backend: str               # "nccl"
+    device: str                # "cuda"
+    world_size: int            # 2
+    dtype: str                 # "bf16" / "fp32"
+    global_batch_size: int
+    micro_batch_size: int
+    context_length: int
+    warmup_steps: int
+    measure_steps: int
+    step_mean_ms: float
+    step_std_ms: float
+    comm_mean_ms: float
+    comm_std_ms: float
+    comm_pct_mean: float       # comm_mean_ms / step_mean_ms * 100
+
+
+class NaiveDDPBenchmarkReporter:
+    def __init__(
+        self,
+        jsonl_path: str | Path,
+        md_path: str | Path,
+        *,
+        title: str = "#### Naive DDP benchmarking (per-parameter all-reduce)",
+    ):
+        self.jsonl_path = Path(jsonl_path)
+        self.md_path = Path(md_path)
+        self.title = title
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row: NaiveDDPBenchRow) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+
+    def read_df(self) -> pd.DataFrame:
+        if not self.jsonl_path.exists():
+            return pd.DataFrame()
+        records: List[Dict[str, Any]] = []
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return pd.DataFrame.from_records(records)
+
+    @staticmethod
+    def _center_align_markdown(md: str) -> str:
+        lines = md.splitlines()
+        if len(lines) < 2:
+            return md
+        header = lines[0]
+        cols = header.count("|") - 1
+        centered = "| " + " | ".join([":---:" for _ in range(cols)]) + " |"
+        return "\n".join([lines[0], centered] + lines[2:])
+
+    def render_markdown(self) -> str:
+        df = self.read_df()
+        if df.empty:
+            return f"{self.title}\n\n(no rows)\n"
+
+        # Sort for readability
+        sort_cols = ["model_size", "dtype", "context_length", "global_batch_size", "world_size", "backend"]
+        df = df.sort_values(sort_cols, ascending=True)
+
+        # Format floats
+        for c in ["step_mean_ms", "step_std_ms", "comm_mean_ms", "comm_std_ms", "comm_pct_mean"]:
+            if c in df.columns:
+                df[c] = df[c].map(lambda x: "" if pd.isna(x) else f"{float(x):.3f}")
+
+        md = [self.title, "", self._center_align_markdown(df.to_markdown(index=False)), ""]
+        return "\n".join(md)
+
+    def write_markdown(self) -> None:
+        self.md_path.write_text(self.render_markdown(), encoding="utf-8")
+
+
+@dataclass
+class MinimalDDPFlatBenchRow:
+    variant: str               # "per_param" or "flat"
+    model_size: str            # "xl"
+    backend: str               # "nccl"
+    device: str                # "cuda"
+    world_size: int            # 2
+    dtype: str                 # "bf16" / "fp32"
+    global_batch_size: int
+    micro_batch_size: int
+    context_length: int
+    warmup_steps: int
+    measure_steps: int
+    step_mean_ms: float
+    step_std_ms: float
+    comm_mean_ms: float
+    comm_std_ms: float
+    comm_pct_mean: float
+
+
+class MinimalDDPFlatBenchmarkReporter:
+    def __init__(self, jsonl_path: str | Path, md_path: str | Path, *,
+                 title: str = "#### Minimal DDP: per-parameter vs flat all-reduce") -> None:
+        self.jsonl_path = Path(jsonl_path)
+        self.md_path = Path(md_path)
+        self.title = title
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row: MinimalDDPFlatBenchRow) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+
+    def _read_df(self) -> pd.DataFrame:
+        if not self.jsonl_path.exists():
+            return pd.DataFrame()
+        records: List[Dict[str, Any]] = []
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return pd.DataFrame.from_records(records)
+
+    @staticmethod
+    def _center_align_markdown(md: str) -> str:
+        lines = md.splitlines()
+        if len(lines) < 2:
+            return md
+        header = lines[0]
+        cols = header.count("|") - 1
+        centered = "| " + " | ".join([":---:" for _ in range(cols)]) + " |"
+        return "\n".join([lines[0], centered] + lines[2:])
+
+    def write_markdown(self) -> None:
+        df = self._read_df()
+        if df.empty:
+            self.md_path.write_text(f"{self.title}\n\n(no rows)\n", encoding="utf-8")
+            return
+
+        df = df.sort_values(["model_size", "dtype", "context_length", "global_batch_size", "variant"])
+        for c in ["step_mean_ms", "step_std_ms", "comm_mean_ms", "comm_std_ms", "comm_pct_mean"]:
+            if c in df.columns:
+                df[c] = df[c].map(lambda x: "" if pd.isna(x) else f"{float(x):.3f}")
+
+        md = "\n".join([self.title, "", self._center_align_markdown(df.to_markdown(index=False)), ""])
+        self.md_path.write_text(md, encoding="utf-8")
+
+
+@dataclass
+class OptimShardMemRow:
+    variant: str                 # "baseline" / "sharded"
+    model_size: str              # "xl"
+    backend: str                 # "nccl"
+    device: str                  # "cuda"
+    world_size: int              # 2
+    dtype: str                   # "fp32" / "bf16"
+    global_batch_size: int
+    micro_batch_size: int
+    context_length: int
+
+    # Peak memory at three timestamps (MB)
+    peak_after_init_mb: float
+    peak_before_step_mb: float
+    peak_after_step_mb: float
+
+    # Breakdown (MB): these are estimates from tensors we can see
+    param_mb: float
+    grad_mb: float
+    optim_state_mb: float
+
+
+class OptimShardMemReporter:
+    def __init__(
+        self,
+        jsonl_path: str | Path,
+        md_path: str | Path,
+        *,
+        title: str = "#### Optimizer state sharding: peak GPU memory accounting",
+    ):
+        self.jsonl_path = Path(jsonl_path)
+        self.md_path = Path(md_path)
+        self.title = title
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row: OptimShardMemRow) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+
+    def read_df(self) -> pd.DataFrame:
+        if not self.jsonl_path.exists():
+            return pd.DataFrame()
+        records: List[Dict[str, Any]] = []
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return pd.DataFrame.from_records(records)
+
+    @staticmethod
+    def _center_align_markdown(md: str) -> str:
+        lines = md.splitlines()
+        if len(lines) < 2:
+            return md
+        header = lines[0]
+        cols = header.count("|") - 1
+        centered = "| " + " | ".join([":---:" for _ in range(cols)]) + " |"
+        return "\n".join([lines[0], centered] + lines[2:])
+
+    def write_markdown(self) -> None:
+        df = self.read_df()
+        if df.empty:
+            self.md_path.write_text(f"{self.title}\n\n(no rows)\n", encoding="utf-8")
+            return
+
+        # Nice ordering
+        df = df.sort_values(["variant", "model_size", "dtype", "context_length", "global_batch_size"])
+
+        # format floats
+        float_cols = [
+            "peak_after_init_mb", "peak_before_step_mb", "peak_after_step_mb",
+            "param_mb", "grad_mb", "optim_state_mb",
+        ]
+        for c in float_cols:
+            if c in df.columns:
+                df[c] = df[c].map(lambda x: "" if pd.isna(x) else f"{float(x):.3f}")
+
+        cols = [
+            "variant", "model_size", "dtype", "world_size",
+            "global_batch_size", "micro_batch_size", "context_length",
+            "peak_after_init_mb", "peak_before_step_mb", "peak_after_step_mb",
+            "param_mb", "grad_mb", "optim_state_mb",
+        ]
+        df = df[cols]
+
+        md = "\n".join([self.title, "", self._center_align_markdown(df.to_markdown(index=False)), ""])
+        self.md_path.write_text(md, encoding="utf-8")
+
+
+@dataclass
+class OptimShardTimeRow:
+    variant: str
+    model_size: str
+    backend: str
+    device: str
+    world_size: int
+    dtype: str
+    global_batch_size: int
+    micro_batch_size: int
+    context_length: int
+    warmup_steps: int
+    measure_steps: int
+    step_mean_ms: float
+    step_std_ms: float
+    
+
+class OptimShardTimeReporter:
+    def __init__(self, jsonl_path: str | Path, md_path: str | Path, *, title: str):
+        self.jsonl_path = Path(jsonl_path)
+        self.md_path = Path(md_path)
+        self.title = title
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        self.md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row: OptimShardTimeRow) -> None:
+        with self.jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(row), ensure_ascii=False) + "\n")
+
+    def read_df(self) -> pd.DataFrame:
+        if not self.jsonl_path.exists():
+            return pd.DataFrame()
+        records = []
+        with self.jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return pd.DataFrame.from_records(records)
+
+    def write_markdown(self) -> None:
+        df = self.read_df()
+        if df.empty:
+            self.md_path.write_text(self.title + "\n\n(no rows)\n", encoding="utf-8")
+            return
+        cols = ["variant", "step_mean_ms", "step_std_ms", "warmup_steps", "measure_steps"]
+        df = df[cols]
+        df["step_mean_ms"] = df["step_mean_ms"].map(lambda x: f"{x:.3f}")
+        df["step_std_ms"] = df["step_std_ms"].map(lambda x: f"{x:.3f}")
+        md = self.title + "\n\n" + df.to_markdown(index=False) + "\n"
+        self.md_path.write_text(md, encoding="utf-8")
