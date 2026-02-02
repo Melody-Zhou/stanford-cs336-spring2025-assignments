@@ -56,6 +56,16 @@ Dependencies are automatically installed based on each assignment's `pyproject.t
 3. Distributed data parallel training
 4. Optimizer state sharding
 
+### [Assignment 3: Scaling](./assignment3-scaling/)
+
+**What you will run**
+
+1. Fit scaling laws using provided IsoFLOPs training data.
+2. Query the training API under a limited FLOPs budget to collect scaling data.
+3. Predict the compute-optimal model size and training loss at a 1e19 FLOPs budget.
+
+>**Note**：Due to the lack of official API access, this assignment could not be fully tested int the current environment. Please refer to: [https://github.com/stanford-cs336/assignment3-scaling/issues/1](https://github.com/stanford-cs336/assignment3-scaling/issues/1)
+
 ## Reference
 
 - [https://github.com/stanford-cs336/assignment1-basics](https://github.com/stanford-cs336/assignment1-basics/tree/main)
