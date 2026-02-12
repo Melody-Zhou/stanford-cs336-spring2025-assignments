@@ -2,7 +2,7 @@
 
 paths:
   # Set to your data, tokenized with GPT-2 tokenizer!
-  train_bin: /data/c-nband/a1-basics/owt_train_gpt2_tok.bin
+  train_bin: ../runs/tokenized_filtered.bin
   
   # The validation set which we have already tokenized with GPT-2 tokenizer, don't change this!
   valid_bin: /data/paloma/tokenized_paloma_c4_100_domains_validation.bin
@@ -10,5 +10,5 @@ paths:
   model_output: output/your_data
 
 training:
-  wandb_entity: ???  # Set to your wandb entity, e.g. pliang
+  wandb_entity: Melody-Zhou  # Set to your wandb entity, e.g. pliang
   wandb_project: cs336-data
