@@ -34,6 +34,7 @@ Dependencies are automatically installed based on each assignment's `pyproject.t
 - [Stanford | CS336 | Language Modeling from Scratch | Spring 2025 | Assignment 2: Systems | DDP Training Implement](https://blog.csdn.net/qq_40672115/article/details/157612052)
 - [Stanford | CS336 | Language Modeling from Scratch | Spring 2025 | Assignment 3: Scaling | Scaling Laws Implement](https://blog.csdn.net/qq_40672115/article/details/157736933)
 - [Stanford | CS336 | Language Modeling from Scratch | Spring 2025 | Assignment 4: Data | Filtering Common Crawl Implement](https://blog.csdn.net/qq_40672115/article/details/157993642)
+- [Stanford | CS336 | Language Modeling from Scratch | Spring 2025 | Assignment 4: Data | Deduplication Implement](https://blog.csdn.net/qq_40672115/article/details/158039586)
 
 ## Assignments
 
